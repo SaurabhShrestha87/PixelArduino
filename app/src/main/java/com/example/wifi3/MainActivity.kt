@@ -8,12 +8,13 @@ import android.net.ConnectivityManager
 import android.net.NetworkInfo
 import android.net.wifi.WifiManager
 import android.os.Bundle
-import android.os.NetworkOnMainThreadException
 import android.util.Log
 import android.view.View
 import android.widget.Button
+import android.widget.CompoundButton
 import android.widget.EditText
 import android.widget.ProgressBar
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import com.google.android.material.snackbar.Snackbar
@@ -21,6 +22,7 @@ import java.io.BufferedWriter
 import java.io.IOException
 import java.io.OutputStreamWriter
 import java.io.PrintWriter
+import java.net.InetAddress
 import java.net.Socket
 import java.net.UnknownHostException
 
@@ -35,11 +37,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var arduinoConnectionSwitch: SwitchCompat
 
     companion object {
-        const val IP = "10.1.10.134"
-        const val PORT = 80
+        const val SERVER_IP = "10.1.10.134"
+        const val SERVER_PORT = 80
     }
 
-    var socket: Socket? = null
+    private var socket: Socket? = null
+    private var thread: Thread? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,7 +60,7 @@ class MainActivity : AppCompatActivity() {
                 if (ConnectivityManager.CONNECTIVITY_ACTION == intent.action) {
                     val networkInfo: NetworkInfo? =
                         intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO)
-                    if (networkInfo?.isConnected == true && networkInfo.typeName.contains("WIFI") ) {
+                    if (networkInfo?.isConnected == true && networkInfo.typeName.contains("WIFI")) {
                         // Wifi is connected
                         Snackbar.make(view, "WiFi is connected", Snackbar.LENGTH_LONG)
                             .setAction("DISMISS") {}.show()
@@ -67,63 +70,88 @@ class MainActivity : AppCompatActivity() {
                             .setAction("DISMISS") {}.show()
                         wifiConnectionSwitch.isChecked = false
                     }
-                    Log.e("TAG", "onReceive: ${networkInfo.toString()}", )
+                    Log.e("TAG", "onReceive: ${networkInfo.toString()}")
                 }
             }
         }
+        arduinoConnectionSwitch.setOnCheckedChangeListener(socketSwitchListener())
+        sendDataButton.setOnClickListener { sendData() }
+    }
 
-        arduinoConnectionSwitch.setOnCheckedChangeListener { _, isChecked ->
+    private fun socketSwitchListener(): CompoundButton.OnCheckedChangeListener {
+        return CompoundButton.OnCheckedChangeListener { button, isChecked ->
             if (isChecked) {
-                if(!connectToArduino()) {
-                    arduinoConnectionSwitch.isChecked = false
-                }
-            }else {
+                button.error = null
+                connectToArduino()
+            } else {
                 disconnectArduino()
             }
         }
-
-        sendDataButton.setOnClickListener {
-            val message = sendDataEditText.text.toString()
-            showProgressBar()
-            try {
-                if (socket != null) {
-                    val out = PrintWriter(
-                        BufferedWriter(OutputStreamWriter(socket!!.getOutputStream())), true
-                    )
-                    out.println(message)
-                    out.close()
-                } else {
-                    if(arduinoConnectionSwitch.isEnabled)
-                        Snackbar.make(view, "Socket was not connected properly", Snackbar.LENGTH_LONG).show()
-                    else
-                        Snackbar.make(view, "Connect To Arduino First", Snackbar.LENGTH_LONG).show()
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            } finally {
-                hideProgressBar()
-            }
+    }
+    private fun silentlySwitchArduino(checked: Boolean) {
+        arduinoConnectionSwitch.setOnClickListener(null)
+        arduinoConnectionSwitch.isChecked = checked
+        arduinoConnectionSwitch.setOnCheckedChangeListener(socketSwitchListener())
+    }
+    private fun checkSwitches() {
+        if (!wifiConnectionSwitch.isChecked) {
+            arduinoConnectionSwitch.error = "Here"
+            Snackbar.make(view, "Please check wifi Connection!", Snackbar.LENGTH_LONG).show()
+        }
+        if (!arduinoConnectionSwitch.isChecked) {
+            arduinoConnectionSwitch.error = "Here"
+            Snackbar.make(view, "Please check Socket Connection!", Snackbar.LENGTH_LONG).show()
         }
     }
-
+    private fun sendData() {
+        val message = sendDataEditText.text.toString()
+        showProgressBar()
+        try {
+            if (socket != null) {
+                val out = PrintWriter(
+                    BufferedWriter(OutputStreamWriter(socket!!.getOutputStream())), true
+                )
+                out.println(message)
+                out.close()
+                sendDataEditText.setText("")
+            } else {
+                checkSwitches()
+            }
+        } catch (e: Exception) {
+            checkSwitches()
+            Snackbar.make(view, "Error: $e", Snackbar.LENGTH_LONG).show()
+            e.printStackTrace()
+        } finally {
+            hideProgressBar()
+        }
+    }
     private fun connectToArduino(): Boolean {
-        return try {
-            socket = Socket(IP, PORT)
-            Snackbar.make(view, "Connected to $IP:$PORT", Snackbar.LENGTH_LONG).show()
-            return  true
-        } catch (e : Exception) {
-            Snackbar.make(view, "ERROR : $e", Snackbar.LENGTH_LONG).show()
+        if (socket == null) {
+            if (thread?.isAlive == true) {
+                thread?.interrupt()
+                thread = null
+            }
+        }
+        return if (socket == null && thread == null) {
+            thread = Thread(ClientThread())
+            thread!!.start()
+            true
+        } else {
+            Toast.makeText(this@MainActivity, "Already Connected", Toast.LENGTH_SHORT).show()
             false
         }
     }
 
     private fun disconnectArduino() {
         try {
-            if(socket != null) {
+            thread?.interrupt()
+            thread = null
+            if (socket != null) {
                 socket!!.close()
                 Snackbar.make(view, "Disconnected Socket", Snackbar.LENGTH_LONG).show()
             } else {
-                Snackbar.make(view, "Socket was not connected properly", Snackbar.LENGTH_LONG).show()
+                Snackbar.make(view, "Socket was not connected properly", Snackbar.LENGTH_LONG)
+                    .show()
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -149,5 +177,41 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         unregisterReceiver(wifiStateReceiver)
+    }
+    internal inner class ClientThread : Runnable {
+        override fun run() {
+            Log.e("TAG", "ClientThread Running")
+            try {
+                val serverAddress: InetAddress = InetAddress.getByName(SERVER_IP)
+                Log.e("TAG", "Attempting socket connection...")
+                socket = Socket(serverAddress, SERVER_PORT)
+                Log.e("TAG", "Socket connection established.")
+                runOnUiThread {
+                    silentlySwitchArduino(false)
+                    Snackbar.make(view, "Connected to socket", Snackbar.LENGTH_LONG).show()
+                }
+            } catch (e1: UnknownHostException) {
+                Log.e("TAG", "UnknownHostException: $e1")
+                runOnUiThread {
+                    silentlySwitchArduino(false)
+                    Snackbar.make(view, "UnknownHostException: $e1", Snackbar.LENGTH_LONG).show()
+                }
+                e1.printStackTrace()
+            } catch (e1: IOException) {
+                Log.e("TAG", "IOException: $e1")
+                runOnUiThread {
+                    silentlySwitchArduino(false)
+                    Snackbar.make(view, "IOException: $e1", Snackbar.LENGTH_LONG).show()
+                }
+                e1.printStackTrace()
+            }catch (e1: RuntimeException) {
+                Log.e("TAG", "RuntimeException: $e1")
+                runOnUiThread {
+                    silentlySwitchArduino(false)
+                    Snackbar.make(view, "IOException: $e1", Snackbar.LENGTH_LONG).show()
+                }
+                e1.printStackTrace()
+            }
+        }
     }
 }
